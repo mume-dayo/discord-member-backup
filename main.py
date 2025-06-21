@@ -131,9 +131,6 @@ async def on_ready():
 @bot.tree.command(name='invite_user', description='認証済みユーザーを指定されたサーバーに招待')
 async def invite_user(interaction: discord.Interaction, user_id: str, target_guild_id: str = None):
     """認証済みユーザーを指定されたサーバーに招待"""
-    if not interaction.user.guild_permissions.manage_guild:
-        await interaction.response.send_message("❌ このコマンドを使用するには「サーバー管理」権限が必要です。", ephemeral=True)
-        return
     if target_guild_id is None:
         target_guild_id = str(interaction.guild.id)
     try:
@@ -222,6 +219,97 @@ async def authlink(interaction: discord.Interaction):
             )
             self.add_item(url_button)
     await interaction.response.send_message(embed=embed, view=AuthView())
+@bot.tree.command(name='invite_all_authenticated', description='認証済みメンバー全員を指定されたサーバーに招待')
+async def invite_all_authenticated(interaction: discord.Interaction, target_guild_id: str = None):
+    """認証済みメンバー全員を指定されたサーバーに招待"""
+    # 権限チェック：管理者またはサーバー管理権限
+    has_permission = (
+        interaction.user.guild_permissions.administrator or
+        interaction.user.guild_permissions.manage_guild or
+        any(role.name.lower() in ['admin', 'administrator'] for role in interaction.user.roles)
+    )
+    
+    if not has_permission:
+        await interaction.response.send_message("❌ このコマンドを使用するには管理者権限が必要です。", ephemeral=True)
+        return
+
+    if target_guild_id is None:
+        target_guild_id = str(interaction.guild.id)
+
+    try:
+        target_guild_id = int(target_guild_id)
+        target_guild = bot.get_guild(target_guild_id)
+        if not target_guild:
+            await interaction.response.send_message("❌ 指定されたサーバーが見つからないか、Botがそのサーバーにいません。", ephemeral=True)
+            return
+
+        bot_member = target_guild.get_member(bot.user.id)
+        if not bot_member or not bot_member.guild_permissions.create_instant_invite:
+            await interaction.response.send_message("❌ Botに招待リンク作成権限がありません。", ephemeral=True)
+            return
+
+        if not authenticated_users:
+            auth_url = REDIRECT_URI.replace('/callback', '/auth')
+            await interaction.response.send_message(f"❌ 認証済みユーザーがいません。\n認証URL: {auth_url}", ephemeral=True)
+            return
+
+        await interaction.response.defer()
+
+        success_count = 0
+        already_member_count = 0
+        error_count = 0
+        error_details = []
+
+        for user_id, user_info in authenticated_users.items():
+            try:
+                access_token = user_info['access_token']
+                
+                headers = {
+                    'Authorization': f'Bot {DISCORD_BOT_TOKEN}',
+                    'Content-Type': 'application/json'
+                }
+
+                put_data = {
+                    'access_token': access_token
+                }
+
+                put_url = f'{DISCORD_API_BASE}/guilds/{target_guild_id}/members/{user_id}'
+                response = requests.put(put_url, headers=headers, json=put_data)
+
+                if response.status_code == 201:
+                    success_count += 1
+                elif response.status_code == 204:
+                    already_member_count += 1
+                else:
+                    error_count += 1
+                    error_details.append(f"User {user_info['user_data']['username']}: {response.status_code}")
+
+            except Exception as e:
+                error_count += 1
+                error_details.append(f"User {user_info['user_data']['username']}: {str(e)}")
+
+        result_embed = discord.Embed(
+            title="一括招待結果",
+            color=0x00ff00 if error_count == 0 else 0xff9900
+        )
+        
+        result_embed.add_field(name="✅ 新規招待", value=success_count, inline=True)
+        result_embed.add_field(name="ℹ️ 既存メンバー", value=already_member_count, inline=True)
+        result_embed.add_field(name="❌ エラー", value=error_count, inline=True)
+        
+        if error_details:
+            error_text = "\n".join(error_details[:5])  # 最初の5つのエラーのみ表示
+            if len(error_details) > 5:
+                error_text += f"\n... 他{len(error_details) - 5}件"
+            result_embed.add_field(name="エラー詳細", value=error_text, inline=False)
+
+        await interaction.followup.send(embed=result_embed)
+
+    except ValueError:
+        await interaction.followup.send("❌ 無効なサーバーIDです。")
+    except Exception as e:
+        await interaction.followup.send(f"❌ エラーが発生しました: {str(e)}")
+
 @bot.tree.command(name='bot_info', description='Botの情報を表示')
 async def bot_info(interaction: discord.Interaction):
     """Botの情報を表示"""
@@ -237,6 +325,42 @@ async def bot_info(interaction: discord.Interaction):
     embed.add_field(name="サーバー数", value=len(bot.guilds), inline=True)
 
     await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name='list_authenticated', description='認証済みユーザーの一覧を表示')
+async def list_authenticated(interaction: discord.Interaction):
+    """認証済みユーザーの一覧を表示"""
+    if not authenticated_users:
+        auth_url = REDIRECT_URI.replace('/callback', '/auth')
+        await interaction.response.send_message(f"❌ 認証済みユーザーがいません。\n認証URL: {auth_url}", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="認証済みユーザー一覧",
+        description=f"総数: {len(authenticated_users)}人",
+        color=0x5865F2
+    )
+
+    user_list = []
+    for user_id, user_info in list(authenticated_users.items())[:20]:  # 最大20人まで表示
+        user_data = user_info['user_data']
+        username = user_data.get('username', 'Unknown')
+        discriminator = user_data.get('discriminator', '0000')
+        if discriminator == '0':  # 新しいDiscordユーザー名形式
+            user_list.append(f"`{user_id}` - @{username}")
+        else:
+            user_list.append(f"`{user_id}` - {username}#{discriminator}")
+
+    if user_list:
+        embed.add_field(
+            name="ユーザー一覧", 
+            value="\n".join(user_list), 
+            inline=False
+        )
+
+    if len(authenticated_users) > 20:
+        embed.set_footer(text=f"... 他{len(authenticated_users) - 20}人")
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 def run_flask():
     port = int(os.environ.get('PORT', 5000))
